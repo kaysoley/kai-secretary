@@ -1,15 +1,19 @@
 import os
+import tempfile
 
 from fastapi import FastAPI
 from openai import OpenAI
 
-app = FastAPI(title="KAI – Secrétaire Kay Soley")
+app = FastAPI(title="KAI - Secretaire Kay Soley")
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+VECTOR_STORE_ID = os.environ["OPENAI_VECTOR_STORE_ID"]
 
 
 @app.get("/")
 def root():
     return {
-        "service": "KAI – Secrétaire Kay Soley",
+        "service": "KAI - Secretaire Kay Soley",
         "status": "online",
     }
 
@@ -21,19 +25,65 @@ def health():
 
 @app.get("/rag-test")
 def rag_test(q: str):
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
     response = client.responses.create(
         model="gpt-5.6",
         input=q,
         tools=[
             {
                 "type": "file_search",
-                "vector_store_ids": [
-                    os.environ["OPENAI_VECTOR_STORE_ID"]
-                ],
+                "vector_store_ids": [VECTOR_STORE_ID],
             }
         ],
     )
 
     return {"answer": response.output_text}
+
+
+@app.get("/rag-pilot")
+def rag_pilot():
+    content = """
+# KAI - Base metier Kay Soley - Test pilote
+
+## Lauramar
+Proprietaire : Marcel Blanc
+Formule : Premium
+Commission Kay Soley : 25 % TTC
+
+## Ti Kay Paradi
+Proprietaire : Loic Portier
+Formule : Premium
+Commission Kay Soley : 25 % TTC
+
+## Villa Goyave
+Proprietaire : Sandrine Brasset
+Formule : Support commercial
+Commission Kay Soley : 15 % TTC
+"""
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        encoding="utf-8",
+        delete=False,
+    ) as f:
+        f.write(content)
+        path = f.name
+
+    with open(path, "rb") as f:
+        uploaded_file = client.files.create(
+            file=f,
+            purpose="assistants",
+        )
+
+    client.vector_stores.files.create_and_poll(
+        vector_store_id=VECTOR_STORE_ID,
+        file_id=uploaded_file.id,
+    )
+
+    os.remove(path)
+
+    return {
+        "status": "completed",
+        "file_id": uploaded_file.id,
+        "vector_store_id": VECTOR_STORE_ID,
+    }

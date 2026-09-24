@@ -123,3 +123,25 @@ def google_test():
         "status": "connected",
         "rows": result.get("values", []),
     }
+@app.get("/google-sources")
+def google_sources():
+    service_account_info = json.loads(
+        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    )
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+
+    drive = build("drive", "v3", credentials=credentials)
+
+    result = drive.files().list(
+        q="trashed = false",
+        fields="files(id,name,mimeType,modifiedTime)",
+        pageSize=100,
+    ).execute()
+
+    return {
+        "sources": result.get("files", [])
+    }

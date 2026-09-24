@@ -86,11 +86,14 @@ Commission Kay Soley : 15 % TTC
 
     os.remove(path)
 
-    return {
+        return {
         "status": "completed",
         "file_id": uploaded_file.id,
         "vector_store_id": VECTOR_STORE_ID,
-        @app.get("/google-test")
+    }
+
+
+@app.get("/google-test")
 def google_test():
     service_account_info = json.loads(
         os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
@@ -119,5 +122,4 @@ def google_test():
     return {
         "status": "connected",
         "rows": result.get("values", []),
-    }
     }

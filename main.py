@@ -9,6 +9,10 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
+# ============================================================
+# APPLICATION
+# ============================================================
+
 app = FastAPI(title="KAI - Secretaire Kay Soley")
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -42,15 +46,19 @@ RAG_SOURCES = {
 # ============================================================
 
 def get_google_credentials():
-    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    service_account_info = json.loads(
+        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    )
 
-    return service_account.Credentials.from_service_account_info(
-        info,
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets.readonly",
             "https://www.googleapis.com/auth/drive.readonly",
         ],
     )
+
+    return credentials
 
 
 def get_google_services():
@@ -74,13 +82,19 @@ def get_google_services():
 
 
 # ============================================================
-# GOOGLE SHEET -> TEXTE POUR LE RAG
+# GOOGLE SHEET -> TEXTE RAG
 # ============================================================
 
-def sheet_to_text(sheets, spreadsheet_id, source_name):
+def sheet_to_text(
+    sheets,
+    spreadsheet_id,
+    source_name,
+):
     metadata = (
         sheets.spreadsheets()
-        .get(spreadsheetId=spreadsheet_id)
+        .get(
+            spreadsheetId=spreadsheet_id
+        )
         .execute()
     )
 
@@ -106,4 +120,167 @@ def sheet_to_text(sheets, spreadsheet_id, source_name):
 
         rows = result.get("values", [])
 
-        sections.append(f"## Onglet : {title}")
+        sections.append(
+            f"## Onglet : {title}"
+        )
+        sections.append("")
+
+        if not rows:
+            sections.append(
+                "(Onglet vide)"
+            )
+            sections.append("")
+            continue
+
+        headers = rows[0]
+
+        for row_number, row in enumerate(
+            rows[1:],
+            start=2,
+        ):
+            if not any(
+                str(value).strip()
+                for value in row
+            ):
+                continue
+
+            sections.append(
+                f"### Ligne {row_number}"
+            )
+
+            max_columns = max(
+                len(headers),
+                len(row),
+            )
+
+            for index in range(max_columns):
+
+                if (
+                    index < len(headers)
+                    and str(headers[index]).strip()
+                ):
+                    header = str(
+                        headers[index]
+                    ).strip()
+                else:
+                    header = (
+                        f"Colonne {index + 1}"
+                    )
+
+                if index < len(row):
+                    value = str(
+                        row[index]
+                    ).strip()
+                else:
+                    value = ""
+
+                if value:
+                    sections.append(
+                        f"- {header} : {value}"
+                    )
+
+            sections.append("")
+
+    return "\n".join(sections)
+
+
+# ============================================================
+# OPENAI VECTOR STORE
+# ============================================================
+
+def safe_filename(name):
+    filename = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        name,
+    )
+
+    return f"KAI_RAG_{filename}.txt"
+
+
+def find_existing_vector_files(
+    source_filename,
+):
+    matches = []
+
+    page = client.vector_stores.files.list(
+        vector_store_id=VECTOR_STORE_ID,
+        limit=100,
+    )
+
+    while True:
+
+        for vector_file in page.data:
+
+            try:
+                openai_file = (
+                    client.files.retrieve(
+                        vector_file.id
+                    )
+                )
+
+                if (
+                    openai_file.filename
+                    == source_filename
+                ):
+                    matches.append(
+                        vector_file.id
+                    )
+
+            except Exception:
+                pass
+
+        if not getattr(
+            page,
+            "has_more",
+            False,
+        ):
+            break
+
+        page = (
+            client.vector_stores.files.list(
+                vector_store_id=VECTOR_STORE_ID,
+                limit=100,
+                after=page.data[-1].id,
+            )
+        )
+
+    return matches
+
+
+def delete_old_vector_versions(
+    source_filename,
+):
+    old_ids = find_existing_vector_files(
+        source_filename
+    )
+
+    for file_id in old_ids:
+
+        try:
+            client.vector_stores.files.delete(
+                vector_store_id=VECTOR_STORE_ID,
+                file_id=file_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            client.files.delete(
+                file_id
+            )
+        except Exception:
+            pass
+
+    return len(old_ids)
+
+
+def upload_to_vector_store(
+    source_name,
+    content,
+):
+    filename = safe_filename(
+        source_name
+    )
+
+   

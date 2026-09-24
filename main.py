@@ -106,4 +106,4 @@ def sheet_to_text(sheets, spreadsheet_id, source_name):
 
         rows = result.get("values", [])
 
-        sections.append(f"## Onglet : {title
+        sections.append(f"## Onglet : {title}")

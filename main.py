@@ -3,6 +3,10 @@ import tempfile
 
 from fastapi import FastAPI
 from openai import OpenAI
+import json
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 app = FastAPI(title="KAI - Secretaire Kay Soley")
 
@@ -86,4 +90,34 @@ Commission Kay Soley : 15 % TTC
         "status": "completed",
         "file_id": uploaded_file.id,
         "vector_store_id": VECTOR_STORE_ID,
+        @app.get("/google-test")
+def google_test():
+    service_account_info = json.loads(
+        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    )
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ],
+    )
+
+    sheets = build("sheets", "v4", credentials=credentials)
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId="1ie_nDiDpetvHmAQjuiPQOlAh5tUEJ51pdGMudafAAWw",
+            range="Propriétaires!A1:G10",
+        )
+        .execute()
+    )
+
+    return {
+        "status": "connected",
+        "rows": result.get("values", []),
+    }
     }

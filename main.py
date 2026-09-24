@@ -1,12 +1,12 @@
 import os
+import json
 import tempfile
 
 from fastapi import FastAPI
 from openai import OpenAI
-import json
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
 
 app = FastAPI(title="KAI - Secretaire Kay Soley")
 
@@ -86,7 +86,7 @@ Commission Kay Soley : 15 % TTC
 
     os.remove(path)
 
-        return {
+    return {
         "status": "completed",
         "file_id": uploaded_file.id,
         "vector_store_id": VECTOR_STORE_ID,

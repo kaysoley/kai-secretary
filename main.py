@@ -282,5 +282,125 @@ def upload_to_vector_store(
     filename = safe_filename(
         source_name
     )
+    deleted_versions = delete_old_vector_versions(filename)
 
+    path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".txt",
+            encoding="utf-8",
+            delete=False,
+        ) as temp:
+            temp.write(content)
+            path = temp.name
+
+        with open(path, "rb") as file_handle:
+            uploaded_file = client.files.create(
+                file=(filename, file_handle),
+                purpose="assistants",
+            )
+
+        client.vector_stores.files.create_and_poll(
+            vector_store_id=VECTOR_STORE_ID,
+            file_id=uploaded_file.id,
+        )
+
+        return {
+            "source": source_name,
+            "filename": filename,
+            "file_id": uploaded_file.id,
+            "old_versions_deleted": deleted_versions,
+            "status": "synced",
+        }
+
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+# ============================================================
+# ENDPOINTS
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "service": "KAI - Secretaire Kay Soley",
+        "status": "online",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/rag-test")
+def rag_test(q: str):
+    response = client.responses.create(
+        model="gpt-5.6",
+        input=q,
+        tools=[
+            {
+                "type": "file_search",
+                "vector_store_ids": [VECTOR_STORE_ID],
+            }
+        ],
+    )
+
+    return {"answer": response.output_text}
+
+
+@app.post("/sync-rag")
+def sync_rag():
+    try:
+        sheets, _ = get_google_services()
+
+        results = []
+
+        for spreadsheet_id, source_name in RAG_SOURCES.items():
+            try:
+                content = sheet_to_text(
+                    sheets,
+                    spreadsheet_id,
+                    source_name,
+                )
+
+                result = upload_to_vector_store(
+                    source_name,
+                    content,
+                )
+
+                results.append(result)
+
+            except Exception as exc:
+                results.append(
+                    {
+                        "source": source_name,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+
+        synced = sum(
+            1
+            for item in results
+            if item["status"] == "synced"
+        )
+
+        return {
+            "status": "completed",
+            "vector_store_id": VECTOR_STORE_ID,
+            "sources_expected": len(RAG_SOURCES),
+            "sources_synced": synced,
+            "results": results,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
    

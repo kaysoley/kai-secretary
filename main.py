@@ -1,8 +1,9 @@
 import os
 import json
 import tempfile
+import re
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -13,6 +14,243 @@ app = FastAPI(title="KAI - Secretaire Kay Soley")
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 VECTOR_STORE_ID = os.environ["OPENAI_VECTOR_STORE_ID"]
 
+
+# ============================================================
+# SOURCES RAG KAI
+# ============================================================
+
+RAG_SOURCES = {
+    "1ie_nDiDpetvHmAQjuiPQOlAh5tUEJ51pdGMudafAAWw":
+        "Liste clients Propriétaires 2026",
+
+    "1Ks71cDeSQjO51lpmrHIQSZKn_CNlmLN5klFh6E8HG1w":
+        "Configuration options annonces clients Plateformes - 2026",
+
+    "1tO3-_4beEVlGB3_S8SGdg1XH06svtJU7KRmc2o87vMY":
+        "Annuaire Prestataires et Artisans",
+
+    "1QKu9XhvBz8JZT9oRuMZTabzuAqdEQHLXdaZ8sxMAWVU":
+        "Répartition concierges et ménage",
+
+    "1yKhLMr2BdvgaW5_BohMsFtnlU5fkWj8eUpMgxv7FBjA":
+        "Grille Responsabilité",
+}
+
+
+# ============================================================
+# GOOGLE
+# ============================================================
+
+def get_google_credentials():
+    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+
+    return service_account.Credentials.from_service_account_info(
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ],
+    )
+
+
+def get_google_services():
+    credentials = get_google_credentials()
+
+    sheets = build(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+    drive = build(
+        "drive",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+    return sheets, drive
+
+
+# ============================================================
+# CONVERSION GOOGLE SHEET -> TEXTE RAG
+# ============================================================
+
+def sheet_to_text(sheets, spreadsheet_id, source_name):
+    metadata = (
+        sheets.spreadsheets()
+        .get(spreadsheetId=spreadsheet_id)
+        .execute()
+    )
+
+    sections = [
+        f"# Source Kay Soley : {source_name}",
+        "",
+        f"Identifiant source Google : {spreadsheet_id}",
+        "",
+    ]
+
+    for sheet in metadata.get("sheets", []):
+        title = sheet["properties"]["title"]
+
+        result = (
+            sheets.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{title}'",
+            )
+            .execute()
+        )
+
+        rows = result.get("values", [])
+
+        sections.append(f"## Onglet : {title}")
+        sections.append("")
+
+        if not rows:
+            sections.append("(Onglet vide)")
+            sections.append("")
+            continue
+
+        headers = rows[0]
+
+        for row_number, row in enumerate(rows[1:], start=2):
+            # Ignore les lignes totalement vides
+            if not any(str(value).strip() for value in row):
+                continue
+
+            sections.append(f"### Ligne {row_number}")
+
+            max_columns = max(len(headers), len(row))
+
+            for index in range(max_columns):
+                header = (
+                    str(headers[index]).strip()
+                    if index < len(headers)
+                    and str(headers[index]).strip()
+                    else f"Colonne {index + 1}"
+                )
+
+                value = (
+                    str(row[index]).strip()
+                    if index < len(row)
+                    else ""
+                )
+
+                if value:
+                    sections.append(f"- {header} : {value}")
+
+            sections.append("")
+
+    return "\n".join(sections)
+
+
+# ============================================================
+# OPENAI VECTOR STORE
+# ============================================================
+
+def safe_filename(name):
+    filename = re.sub(r"[^A-Za-z0-9_-]+", "_", name)
+    return f"KAI_RAG_{filename}.txt"
+
+
+def find_existing_vector_files(source_filename):
+    matches = []
+
+    page = client.vector_stores.files.list(
+        vector_store_id=VECTOR_STORE_ID,
+        limit=100,
+    )
+
+    while True:
+        for vector_file in page.data:
+            try:
+                openai_file = client.files.retrieve(vector_file.id)
+
+                if openai_file.filename == source_filename:
+                    matches.append(vector_file.id)
+
+            except Exception:
+                pass
+
+        if not getattr(page, "has_more", False):
+            break
+
+        page = client.vector_stores.files.list(
+            vector_store_id=VECTOR_STORE_ID,
+            limit=100,
+            after=page.data[-1].id,
+        )
+
+    return matches
+
+
+def delete_old_vector_versions(source_filename):
+    old_ids = find_existing_vector_files(source_filename)
+
+    for file_id in old_ids:
+        try:
+            client.vector_stores.files.delete(
+                vector_store_id=VECTOR_STORE_ID,
+                file_id=file_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            client.files.delete(file_id)
+        except Exception:
+            pass
+
+    return len(old_ids)
+
+
+def upload_to_vector_store(source_name, content):
+    filename = safe_filename(source_name)
+
+    deleted_versions = delete_old_vector_versions(filename)
+
+    path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".txt",
+            encoding="utf-8",
+            delete=False,
+        ) as temp:
+            temp.write(content)
+            path = temp.name
+
+        with open(path, "rb") as file_handle:
+            uploaded_file = client.files.create(
+                file=(filename, file_handle),
+                purpose="assistants",
+            )
+
+        client.vector_stores.files.create_and_poll(
+            vector_store_id=VECTOR_STORE_ID,
+            file_id=uploaded_file.id,
+        )
+
+        return {
+            "source": source_name,
+            "filename": filename,
+            "file_id": uploaded_file.id,
+            "old_versions_deleted": deleted_versions,
+            "status": "synced",
+        }
+
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
 @app.get("/")
 def root():
@@ -43,78 +281,16 @@ def rag_test(q: str):
     return {"answer": response.output_text}
 
 
-@app.get("/rag-pilot")
-def rag_pilot():
-    content = """
-# KAI - Base metier Kay Soley - Test pilote
-
-## Lauramar
-Proprietaire : Marcel Blanc
-Formule : Premium
-Commission Kay Soley : 25 % TTC
-
-## Ti Kay Paradi
-Proprietaire : Loic Portier
-Formule : Premium
-Commission Kay Soley : 25 % TTC
-
-## Villa Goyave
-Proprietaire : Sandrine Brasset
-Formule : Support commercial
-Commission Kay Soley : 15 % TTC
-"""
-
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".md",
-        encoding="utf-8",
-        delete=False,
-    ) as f:
-        f.write(content)
-        path = f.name
-
-    with open(path, "rb") as f:
-        uploaded_file = client.files.create(
-            file=f,
-            purpose="assistants",
-        )
-
-    client.vector_stores.files.create_and_poll(
-        vector_store_id=VECTOR_STORE_ID,
-        file_id=uploaded_file.id,
-    )
-
-    os.remove(path)
-
-    return {
-        "status": "completed",
-        "file_id": uploaded_file.id,
-        "vector_store_id": VECTOR_STORE_ID,
-    }
-
-
 @app.get("/google-test")
 def google_test():
-    service_account_info = json.loads(
-        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    )
-
-    credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ],
-    )
-
-    sheets = build("sheets", "v4", credentials=credentials)
+    sheets, drive = get_google_services()
 
     result = (
         sheets.spreadsheets()
         .values()
         .get(
             spreadsheetId="1ie_nDiDpetvHmAQjuiPQOlAh5tUEJ51pdGMudafAAWw",
-            range="Propriétaires!A1:G10",
+            range="Propriétaire!A1:G10",
         )
         .execute()
     )
@@ -123,18 +299,11 @@ def google_test():
         "status": "connected",
         "rows": result.get("values", []),
     }
+
+
 @app.get("/google-sources")
 def google_sources():
-    service_account_info = json.loads(
-        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    )
-
-    credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-
-    drive = build("drive", "v3", credentials=credentials)
+    sheets, drive = get_google_services()
 
     result = drive.files().list(
         q="trashed = false",
@@ -145,3 +314,54 @@ def google_sources():
     return {
         "sources": result.get("files", [])
     }
+
+
+@app.post("/sync-rag")
+def sync_rag():
+    try:
+        sheets, drive = get_google_services()
+
+        results = []
+
+        for spreadsheet_id, source_name in RAG_SOURCES.items():
+            try:
+                content = sheet_to_text(
+                    sheets,
+                    spreadsheet_id,
+                    source_name,
+                )
+
+                result = upload_to_vector_store(
+                    source_name,
+                    content,
+                )
+
+                results.append(result)
+
+            except Exception as exc:
+                results.append(
+                    {
+                        "source": source_name,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+
+        synced = sum(
+            1 for item in results
+            if item["status"] == "synced"
+        )
+
+        return {
+            "status": "completed",
+            "vector_store_id": VECTOR_STORE_ID,
+            "sources_expected": len(RAG_SOURCES),
+            "sources_synced": synced,
+            "results": results,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )

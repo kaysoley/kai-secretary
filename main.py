@@ -3,7 +3,7 @@ import json
 import tempfile
 import re
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Query
 from openai import OpenAI
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -403,4 +403,50 @@ def sync_rag():
             status_code=500,
             detail=str(exc),
         )
-   
+   # ============================================================
+# WHATSAPP WEBHOOK
+# ============================================================
+
+WHATSAPP_VERIFY_TOKEN = os.environ["WHATSAPP_VERIFY_TOKEN"]
+
+
+@app.get("/webhook")
+def verify_whatsapp_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+):
+    """
+    Vérification du webhook demandée par Meta.
+    """
+
+    if (
+        hub_mode == "subscribe"
+        and hub_verify_token == WHATSAPP_VERIFY_TOKEN
+    ):
+        return int(hub_challenge)
+
+    raise HTTPException(
+        status_code=403,
+        detail="Invalid verification token",
+    )
+
+
+@app.post("/webhook")
+async def receive_whatsapp_webhook(request: Request):
+    """
+    Réception des événements WhatsApp envoyés par Meta.
+    Pour l'instant, on confirme simplement leur réception.
+    """
+
+    payload = await request.json()
+
+    print(
+        "WHATSAPP WEBHOOK:",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+        ),
+    )
+
+    return {"status": "received"}

@@ -3,6 +3,8 @@ import json
 import tempfile
 import re
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import urllib.request
 import urllib.error
 
@@ -483,32 +485,192 @@ def send_whatsapp_text(recipient: str, text: str) -> None:
         raise
 
 
-def process_whatsapp_text(sender: str, message: str) -> None:
-    """Traite le message en arrière-plan, sans bloquer l'ACK du webhook."""
+# ============================================================
+# TODOIST — API REST v1
+# ============================================================
+
+TODOIST_API_TOKEN = os.environ["TODOIST_API_TOKEN"]
+TODOIST_BASE_URL = "https://api.todoist.com/api/v1"
+
+
+def todoist_request(method: str, path: str, payload=None, params=None):
+    """Accès Todoist côté serveur : ne jamais exposer le jeton au modèle."""
+    from urllib.parse import urlencode
+    url = TODOIST_BASE_URL + path
+    if params:
+        url += "?" + urlencode({k: v for k, v in params.items() if v is not None})
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url, data=data, method=method,
+        headers={
+            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
     try:
-        response = client.responses.create(
-            model="gpt-5.6",
-            instructions=(
-                "Tu es KAI, secrétaire IA interne de Kay Soley, une conciergerie "
-                "en Martinique. Réponds en français de façon claire et concise. "
-                "Utilise la recherche documentaire pour les questions sur Kay Soley. "
-                "Ne fabrique pas d'informations absentes des documents. "
-                "Ne prétends jamais avoir exécuté une action (mail, facture, tâche) "
-                "si aucun outil ne l'a réellement réalisée."
-            ),
-            input=message,
-            tools=[{
-                "type": "file_search",
-                "vector_store_ids": [VECTOR_STORE_ID],
-            }],
+        with urllib.request.urlopen(request, timeout=25) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {"success": True}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.warning("Todoist API error HTTP %s: %s", exc.code, detail[:300])
+        return {"error": "Erreur Todoist", "http_status": exc.code, "details": detail[:300]}
+    except Exception:
+        logger.exception("Todoist connection failed")
+        return {"error": "Connexion Todoist indisponible"}
+
+
+def todoist_list(path: str, params=None, max_pages=5):
+    """Parcourt les résultats paginés, avec une limite de sécurité."""
+    all_results = []
+    cursor = None
+    for _ in range(max_pages):
+        query = dict(params or {})
+        if cursor:
+            query["cursor"] = cursor
+        result = todoist_request("GET", path, params=query)
+        if isinstance(result, dict) and "error" in result:
+            return result
+        if isinstance(result, list):
+            all_results.extend(result)
+            break
+        if not isinstance(result, dict):
+            return {"error": "Format de réponse Todoist inattendu"}
+        all_results.extend(result.get("results", []))
+        cursor = result.get("next_cursor")
+        if not cursor:
+            break
+    return {"results": all_results, "truncated": bool(cursor)}
+
+
+TODOIST_TOOLS = [
+    {"type": "function", "name": "todoist_projects", "description": "Lister les projets Todoist avec leurs identifiants.",
+     "parameters": {"type": "object", "properties": {}, "additionalProperties": False}, "strict": True},
+    {"type": "function", "name": "todoist_sections", "description": "Lister les sections d'un projet Todoist.",
+     "parameters": {"type": "object", "properties": {"project_id": {"type": "string"}},
+                    "required": ["project_id"], "additionalProperties": False}, "strict": True},
+    {"type": "function", "name": "todoist_tasks", "description": "Consulter les tâches actives, filtrées par projet, section ou échéance. Pour une recherche textuelle, parcourir les résultats.",
+     "parameters": {"type": "object", "properties": {
+         "project_id": {"type": ["string", "null"]},
+         "section_id": {"type": ["string", "null"]}},
+         "required": ["project_id", "section_id"], "additionalProperties": False}, "strict": True},
+    {"type": "function", "name": "todoist_create_task", "description": "Créer une tâche Todoist. Priorité Todoist 4 = P1 (urgente), 3 = P2, 2 = P3, 1 = P4.",
+     "parameters": {"type": "object", "properties": {
+         "content": {"type": "string"}, "description": {"type": ["string", "null"]},
+         "project_id": {"type": ["string", "null"]}, "section_id": {"type": ["string", "null"]},
+         "priority": {"type": ["integer", "null"]}, "due_string": {"type": ["string", "null"]}},
+         "required": ["content", "description", "project_id", "section_id", "priority", "due_string"],
+         "additionalProperties": False}, "strict": True},
+    {"type": "function", "name": "todoist_update_task", "description": "Modifier le contenu, la description, la priorité ou l'échéance d'une tâche existante.",
+     "parameters": {"type": "object", "properties": {
+         "task_id": {"type": "string"}, "content": {"type": ["string", "null"]},
+         "description": {"type": ["string", "null"]}, "priority": {"type": ["integer", "null"]},
+         "due_string": {"type": ["string", "null"]}},
+         "required": ["task_id", "content", "description", "priority", "due_string"],
+         "additionalProperties": False}, "strict": True},
+    {"type": "function", "name": "todoist_move_task", "description": "Déplacer une tâche dans un projet ou une section. Confirmer le bon projet/section avant déplacement.",
+     "parameters": {"type": "object", "properties": {
+         "task_id": {"type": "string"}, "project_id": {"type": ["string", "null"]},
+         "section_id": {"type": ["string", "null"]}},
+         "required": ["task_id", "project_id", "section_id"], "additionalProperties": False}, "strict": True},
+    {"type": "function", "name": "todoist_complete_task", "description": "Marquer comme terminée une tâche explicitement désignée par l'utilisateur.",
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"], "additionalProperties": False}, "strict": True},
+]
+
+
+def execute_todoist_tool(name: str, args: dict):
+    if name == "todoist_projects":
+        return todoist_list("/projects")
+    if name == "todoist_sections":
+        return todoist_list("/sections", {"project_id": args["project_id"]})
+    if name == "todoist_tasks":
+        return todoist_list("/tasks", {k: args.get(k) for k in ("project_id", "section_id")})
+    if name == "todoist_create_task":
+        payload = {k: v for k, v in args.items() if v is not None}
+        if not payload.get("content", "").strip():
+            return {"error": "Contenu de tâche manquant"}
+        if "priority" in payload and payload["priority"] not in (1, 2, 3, 4):
+            return {"error": "Priorité incorrecte"}
+        return todoist_request("POST", "/tasks", payload)
+    if name == "todoist_update_task":
+        task_id = args["task_id"]
+        payload = {k: v for k, v in args.items() if k != "task_id" and v is not None}
+        if not payload:
+            return {"error": "Aucune modification indiquée"}
+        if "priority" in payload and payload["priority"] not in (1, 2, 3, 4):
+            return {"error": "Priorité incorrecte"}
+        return todoist_request("POST", f"/tasks/{task_id}", payload)
+    if name == "todoist_move_task":
+        task_id = args["task_id"]
+        payload = {k: v for k, v in args.items() if k != "task_id" and v is not None}
+        if not payload:
+            return {"error": "Projet ou section manquant"}
+        return todoist_request("POST", f"/tasks/{task_id}/move", payload)
+    if name == "todoist_complete_task":
+        return todoist_request("POST", f"/tasks/{args['task_id']}/close")
+    return {"error": "Outil non autorisé"}
+
+
+def process_whatsapp_text(sender: str, message: str) -> None:
+    """Répond aux messages WhatsApp et exécute les outils Todoist autorisés."""
+    try:
+        local_now = datetime.now(ZoneInfo("America/Martinique"))
+        instructions = (
+            "Tu es KAI, secrétaire IA interne de Kay Soley, conciergerie en Martinique. "
+            "Réponds en français de façon claire et concise. "
+            f"Date et heure locales actuelles : {local_now.strftime('%Y-%m-%d %H:%M')} (Martinique, UTC-4). "
+            "Utilise la recherche documentaire pour les questions sur Kay Soley. "
+            "Tu as accès aux outils Todoist. Pour agir sur une tâche existante, recherche "
+            "son identifiant exact et vérifie le projet. Ne devine jamais un identifiant. "
+            "Les priorités Todoist sont inversées : P1=4, P2=3, P3=2, P4=1. "
+            "N'exécute une modification que si elle est clairement demandée. "
+            "Demande confirmation avant un changement important ou ambigu. "
+            "Ne supprime jamais de tâche (aucun outil de suppression disponible). "
+            "Ne prétends pas avoir envoyé d'email, créé un événement ou effectué une action "
+            "si aucun outil ne l'a réellement exécutée. "
+            "Quand l'API signale une erreur, dis clairement que l'action a échoué. "
+            "Un message WhatsApp transféré n'identifie pas forcément son auteur ou son logement : "
+            "demande une précision si nécessaire."
         )
+        tools = [{"type": "file_search", "vector_store_ids": [VECTOR_STORE_ID]}] + TODOIST_TOOLS
+        response = client.responses.create(
+            model="gpt-5.6", instructions=instructions, input=message, tools=tools,
+        )
+        for _ in range(6):
+            calls = [item for item in response.output if item.type == "function_call"]
+            if not calls:
+                break
+            outputs = []
+            for call in calls:
+                try:
+                    args = json.loads(call.arguments)
+                    result = execute_todoist_tool(call.name, args)
+                except Exception:
+                    logger.exception("Todoist tool processing failed")
+                    result = {"error": "Erreur interne pendant l'action Todoist"}
+                outputs.append({
+                    "type": "function_call_output", "call_id": call.call_id,
+                    "output": json.dumps(result, ensure_ascii=False)[:50000],
+                })
+            response = client.responses.create(
+                model="gpt-5.6", instructions=instructions,
+                previous_response_id=response.id, input=outputs, tools=tools,
+            )
+        else:
+            send_whatsapp_text(sender, "La demande nécessite trop d'étapes. Peux-tu la simplifier ?")
+            return
         answer = (response.output_text or "").strip()
         if not answer:
-            answer = "J'ai bien reçu ton message, mais je n'ai pas pu formuler de réponse."
+            answer = "J'ai reçu ton message, mais je n'ai pas pu formuler de réponse."
         send_whatsapp_text(sender, answer)
         logger.info("KAI replied to authorized sender")
     except Exception:
         logger.exception("KAI message processing failed")
+        try:
+            send_whatsapp_text(sender, "Une erreur technique est survenue. Vérifie les logs Railway.")
+        except Exception:
+            logger.exception("Could not send error notification")
 
 
 @app.post("/webhook")

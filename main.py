@@ -3,6 +3,9 @@ import json
 import tempfile
 import re
 import logging
+import hashlib
+import threading
+from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import urllib.request
@@ -14,6 +17,8 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from openai import OpenAI
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import psycopg
+from psycopg.types.json import Jsonb
 
 
 # ============================================================
@@ -612,65 +617,192 @@ def execute_todoist_tool(name: str, args: dict):
     return {"error": "Outil non autorisé"}
 
 
+# ============================================================
+# MEMOIRE POSTGRESQL : messages, références Todoist, audit
+# ============================================================
+# Railway fournit DATABASE_URL lorsque PostgreSQL est lié au service.
+DATABASE_URL = os.environ["DATABASE_URL"]
+_sender_locks = defaultdict(threading.Lock)
+
+
+def db_connection():
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
+def initialize_memory():
+    with db_connection() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS kai_messages (
+            id BIGSERIAL PRIMARY KEY,
+            sender TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS kai_messages_sender_idx
+                        ON kai_messages (sender, id DESC)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS kai_task_references (
+            sender TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            task_id TEXT NOT NULL,
+            task_title TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (sender, position)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS kai_actions (
+            id BIGSERIAL PRIMARY KEY,
+            sender TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            arguments JSONB NOT NULL,
+            result JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS kai_webhook_events (
+            message_id TEXT PRIMARY KEY,
+            received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+
+def recent_messages(sender, limit=24):
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM kai_messages WHERE sender=%s ORDER BY id DESC LIMIT %s",
+            (sender, limit),
+        ).fetchall()
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+
+def save_message(sender, role, content):
+    with db_connection() as conn:
+        conn.execute("INSERT INTO kai_messages(sender,role,content) VALUES (%s,%s,%s)",
+                     (sender, role, content[:16000]))
+
+
+def task_references(sender):
+    with db_connection() as conn:
+        return conn.execute(
+            "SELECT position,task_id,task_title FROM kai_task_references WHERE sender=%s ORDER BY position",
+            (sender,),
+        ).fetchall()
+
+
+def save_task_references(sender, refs):
+    if not refs:
+        return
+    with db_connection() as conn:
+        conn.execute("DELETE FROM kai_task_references WHERE sender=%s", (sender,))
+        for pos, task_id, title in refs:
+            conn.execute("""INSERT INTO kai_task_references(sender,position,task_id,task_title)
+                            VALUES (%s,%s,%s,%s)""", (sender, pos, task_id, title[:500]))
+
+
+def record_action(sender, tool, args, result):
+    with db_connection() as conn:
+        conn.execute("""INSERT INTO kai_actions(sender,tool,arguments,result)
+                        VALUES (%s,%s,%s,%s)""", (sender, tool, Jsonb(args), Jsonb(result)))
+
+
+def mark_incoming(message_id):
+    if not message_id:
+        return True
+    with db_connection() as conn:
+        return conn.execute("""INSERT INTO kai_webhook_events(message_id)
+                               VALUES (%s) ON CONFLICT DO NOTHING RETURNING message_id""",
+                            (message_id,)).fetchone() is not None
+
+
+def parse_numbered_task_refs(answer):
+    """Capture exact task ids from explicit assistant markers; strip markers before WhatsApp."""
+    refs = []
+    cleaned = []
+    for line in answer.splitlines():
+        match = re.search(r"(?:^|\s)(\d{1,2})[.)]\s+(.+?)\s*\[task_id:([0-9A-Za-z_-]+)\]", line)
+        if match:
+            refs.append((int(match.group(1)), match.group(3), match.group(2)))
+        cleaned.append(re.sub(r"\s*\[task_id:[0-9A-Za-z_-]+\]", "", line))
+    return "\n".join(cleaned), refs
+
+
 def process_whatsapp_text(sender: str, message: str) -> None:
-    """Répond aux messages WhatsApp et exécute les outils Todoist autorisés."""
-    try:
-        local_now = datetime.now(ZoneInfo("America/Martinique"))
-        instructions = (
-            "Tu es KAI, secrétaire IA interne de Kay Soley, conciergerie en Martinique. "
-            "Réponds en français de façon claire et concise. "
-            f"Date et heure locales actuelles : {local_now.strftime('%Y-%m-%d %H:%M')} (Martinique, UTC-4). "
-            "Utilise la recherche documentaire pour les questions sur Kay Soley. "
-            "Tu as accès aux outils Todoist. Pour agir sur une tâche existante, recherche "
-            "son identifiant exact et vérifie le projet. Ne devine jamais un identifiant. "
-            "Les priorités Todoist sont inversées : P1=4, P2=3, P3=2, P4=1. "
-            "N'exécute une modification que si elle est clairement demandée. "
-            "Demande confirmation avant un changement important ou ambigu. "
-            "Ne supprime jamais de tâche (aucun outil de suppression disponible). "
-            "Ne prétends pas avoir envoyé d'email, créé un événement ou effectué une action "
-            "si aucun outil ne l'a réellement exécutée. "
-            "Quand l'API signale une erreur, dis clairement que l'action a échoué. "
-            "Un message WhatsApp transféré n'identifie pas forcément son auteur ou son logement : "
-            "demande une précision si nécessaire."
-        )
-        tools = [{"type": "file_search", "vector_store_ids": [VECTOR_STORE_ID]}] + TODOIST_TOOLS
-        response = client.responses.create(
-            model="gpt-5.6", instructions=instructions, input=message, tools=tools,
-        )
-        for _ in range(6):
-            calls = [item for item in response.output if item.type == "function_call"]
-            if not calls:
-                break
-            outputs = []
-            for call in calls:
-                try:
-                    args = json.loads(call.arguments)
-                    result = execute_todoist_tool(call.name, args)
-                except Exception:
-                    logger.exception("Todoist tool processing failed")
-                    result = {"error": "Erreur interne pendant l'action Todoist"}
-                outputs.append({
-                    "type": "function_call_output", "call_id": call.call_id,
-                    "output": json.dumps(result, ensure_ascii=False)[:50000],
-                })
-            response = client.responses.create(
-                model="gpt-5.6", instructions=instructions,
-                previous_response_id=response.id, input=outputs, tools=tools,
-            )
-        else:
-            send_whatsapp_text(sender, "La demande nécessite trop d'étapes. Peux-tu la simplifier ?")
-            return
-        answer = (response.output_text or "").strip()
-        if not answer:
-            answer = "J'ai reçu ton message, mais je n'ai pas pu formuler de réponse."
-        send_whatsapp_text(sender, answer)
-        logger.info("KAI replied to authorized sender")
-    except Exception:
-        logger.exception("KAI message processing failed")
+    """One conversation per sender; persistent history and verified Todoist actions."""
+    with _sender_locks[sender]:
         try:
-            send_whatsapp_text(sender, "Une erreur technique est survenue. Vérifie les logs Railway.")
+            initialize_memory()
+            history = recent_messages(sender)
+            references = task_references(sender)
+            local_now = datetime.now(ZoneInfo("America/Martinique"))
+            ref_text = "\n".join(f"{pos}. {title} => task_id={task_id}"
+                                 for pos, task_id, title in references) or "(aucune liste numérotée enregistrée)"
+            instructions = (
+                "Tu es KAI, secrétaire IA interne de Kay Soley. Réponds en français, simplement. "
+                f"Date/heure Martinique: {local_now:%Y-%m-%d %H:%M}. "
+                "Tu disposes de l'historique récent de cette conversation. "
+                "Quand l'utilisateur dit 'la 1', 'la deuxième', etc., utilise EXCLUSIVEMENT "
+                "la correspondance numérotée ci-dessous. Si la référence est absente ou ambiguë, demande une précision. "
+                "Correspondances de la dernière liste de tâches affichée :\n" + ref_text + "\n"
+                "Lorsque tu affiches une liste NUMÉROTÉE de tâches Todoist, ajoute à la fin de "
+                "CHAQUE ligne le marqueur [task_id:IDENTIFIANT_REEL] tiré des résultats de l'outil. "
+                "Ne mets jamais de marqueur sur une tâche dont tu ignores l'identifiant. "
+                "Ces marqueurs seront supprimés avant l'envoi à l'utilisateur. "
+                "Ne confonds pas numéro de liste et identifiant Todoist. "
+                "Utilise file_search pour les documents Kay Soley. "
+                "Priorités Todoist : P1=4, P2=3, P3=2, P4=1. "
+                "Pour une tâche existante, vérifie l'identifiant exact. "
+                "N'effectue pas d'action ambiguë. Confirme les changements importants. "
+                "Ne prétends jamais avoir exécuté une action sans succès confirmé par l'outil. "
+                "Si un outil réussit puis une autre étape échoue, décris les deux résultats distinctement. "
+                "Ne prétends pas pouvoir utiliser Gmail ou Agenda. "
+            )
+            tools = [{"type": "file_search", "vector_store_ids": [VECTOR_STORE_ID]}] + TODOIST_TOOLS
+            conversation = history + [{"role": "user", "content": message}]
+            response = client.responses.create(
+                model="gpt-5.6", instructions=instructions, input=conversation, tools=tools,
+            )
+            actions_this_turn = []
+            for _ in range(12):
+                calls = [item for item in response.output if item.type == "function_call"]
+                if not calls:
+                    break
+                outputs = []
+                for call in calls:
+                    try:
+                        args = json.loads(call.arguments)
+                        result = execute_todoist_tool(call.name, args)
+                        if call.name in {"todoist_create_task", "todoist_update_task", "todoist_move_task", "todoist_complete_task"}:
+                            record_action(sender, call.name, args, result)
+                            actions_this_turn.append((call.name, result))
+                    except Exception:
+                        logger.exception("Todoist tool processing failed")
+                        result = {"error": "Erreur interne pendant l'action Todoist"}
+                    outputs.append({"type": "function_call_output", "call_id": call.call_id,
+                                    "output": json.dumps(result, ensure_ascii=False)[:50000]})
+                response = client.responses.create(
+                    model="gpt-5.6", instructions=instructions,
+                    previous_response_id=response.id, input=outputs, tools=tools,
+                )
+            else:
+                successful = [name for name, result in actions_this_turn if not (isinstance(result, dict) and result.get("error"))]
+                answer = ("J'ai effectué ces actions : " + ", ".join(successful) + ". " if successful else "")
+                answer += "Je n'ai pas pu terminer toutes les étapes. Peux-tu préciser la suite ?"
+                save_message(sender, "user", message)
+                save_message(sender, "assistant", answer)
+                send_whatsapp_text(sender, answer)
+                return
+            answer = (response.output_text or "").strip()
+            if not answer:
+                answer = "J'ai reçu ton message, mais je n'ai pas pu formuler de réponse."
+            clean_answer, refs = parse_numbered_task_refs(answer)
+            save_message(sender, "user", message)
+            save_message(sender, "assistant", clean_answer)
+            if refs:
+                save_task_references(sender, refs)
+            send_whatsapp_text(sender, clean_answer)
+            logger.info("KAI replied to authorized sender")
         except Exception:
-            logger.exception("Could not send error notification")
+            logger.exception("KAI message processing failed")
+            try:
+                send_whatsapp_text(sender, "Une erreur technique est survenue. Vérifie les logs Railway.")
+            except Exception:
+                logger.exception("Could not send error notification")
 
 
 @app.post("/webhook")
@@ -693,6 +825,13 @@ async def receive_whatsapp_webhook(request: Request, background_tasks: Backgroun
                     continue
                 if sender not in ALLOWED_WHATSAPP_NUMBERS:
                     logger.warning("Ignored WhatsApp message from unauthorized sender")
+                    continue
+                try:
+                    initialize_memory()
+                    if not mark_incoming(message.get("id")):
+                        continue
+                except Exception:
+                    logger.exception("Database unavailable; message not processed")
                     continue
                 background_tasks.add_task(process_whatsapp_text, sender, body)
                 queued += 1

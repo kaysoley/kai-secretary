@@ -2,6 +2,11 @@ import os
 import json
 import tempfile
 import re
+import logging
+import urllib.request
+import urllib.error
+
+from fastapi import BackgroundTasks
 
 from fastapi import FastAPI, HTTPException, Request, Query
 from openai import OpenAI
@@ -432,21 +437,103 @@ def verify_whatsapp_webhook(
     )
 
 
-@app.post("/webhook")
-async def receive_whatsapp_webhook(request: Request):
-    """
-    Réception des événements WhatsApp envoyés par Meta.
-    Pour l'instant, on confirme simplement leur réception.
-    """
+# Identifiants nécessaires à l'envoi des réponses WhatsApp.
+WHATSAPP_ACCESS_TOKEN = os.environ["WHATSAPP_ACCESS_TOKEN"]
+WHATSAPP_PHONE_NUMBER_ID = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
 
-    payload = await request.json()
+# Sécurité : seuls les numéros explicitement autorisés peuvent consulter le RAG.
+# Exemple de variable Railway : KAI_ALLOWED_WHATSAPP_NUMBERS=596696199338
+ALLOWED_WHATSAPP_NUMBERS = {
+    number.strip().lstrip("+")
+    for number in os.getenv("KAI_ALLOWED_WHATSAPP_NUMBERS", "").split(",")
+    if number.strip()
+}
 
-    print(
-        "WHATSAPP WEBHOOK:",
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-        ),
+logger = logging.getLogger("kai.whatsapp")
+
+
+def send_whatsapp_text(recipient: str, text: str) -> None:
+    """Envoie un message texte via WhatsApp Cloud API."""
+    url = (
+        "https://graph.facebook.com/v26.0/"
+        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
     )
+    body = json.dumps({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "text",
+        "text": {"preview_url": False, "body": text[:4096]},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            logger.info("WhatsApp outbound HTTP %s", response.status)
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        logger.error("WhatsApp outbound HTTP %s: %s", exc.code, error_text[:800])
+        raise
 
+
+def process_whatsapp_text(sender: str, message: str) -> None:
+    """Traite le message en arrière-plan, sans bloquer l'ACK du webhook."""
+    try:
+        response = client.responses.create(
+            model="gpt-5.6",
+            instructions=(
+                "Tu es KAI, secrétaire IA interne de Kay Soley, une conciergerie "
+                "en Martinique. Réponds en français de façon claire et concise. "
+                "Utilise la recherche documentaire pour les questions sur Kay Soley. "
+                "Ne fabrique pas d'informations absentes des documents. "
+                "Ne prétends jamais avoir exécuté une action (mail, facture, tâche) "
+                "si aucun outil ne l'a réellement réalisée."
+            ),
+            input=message,
+            tools=[{
+                "type": "file_search",
+                "vector_store_ids": [VECTOR_STORE_ID],
+            }],
+        )
+        answer = (response.output_text or "").strip()
+        if not answer:
+            answer = "J'ai bien reçu ton message, mais je n'ai pas pu formuler de réponse."
+        send_whatsapp_text(sender, answer)
+        logger.info("KAI replied to authorized sender")
+    except Exception:
+        logger.exception("KAI message processing failed")
+
+
+@app.post("/webhook")
+async def receive_whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Accuse réception des événements Meta et traite les textes autorisés."""
+    payload = await request.json()
+    queued = 0
+
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") != "messages":
+                continue
+            value = change.get("value", {})
+            for message in value.get("messages", []):
+                if message.get("type") != "text":
+                    continue
+                sender = str(message.get("from", "")).lstrip("+")
+                body = message.get("text", {}).get("body", "").strip()
+                if not sender or not body:
+                    continue
+                if sender not in ALLOWED_WHATSAPP_NUMBERS:
+                    logger.warning("Ignored WhatsApp message from unauthorized sender")
+                    continue
+                background_tasks.add_task(process_whatsapp_text, sender, body)
+                queued += 1
+
+    logger.info("WhatsApp webhook received; queued_messages=%s", queued)
     return {"status": "received"}
